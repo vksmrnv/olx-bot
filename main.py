@@ -272,56 +272,76 @@ def analyze(text):
 #  OLX
 # ---------------------------------------------------------------------------
 
-def normalize_url(url):
-    p = urlparse(url)
-    qs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-          if k not in ("min_id", "reason", "search[order]", "page")]
-    qs.append(("search[order]", "created_at:desc"))
-    return urlunparse(p._replace(query=urlencode(qs)))
+OLX_API = "https://www.olx.ua/api/v1/offers/"
+
+# Области OLX: кусок ссылки -> id
+REGION_IDS = {"pol": 15, "chk": 12, "kir": 7, "vin": 24}
 
 
-def fetch(url):
+def api_get(params):
+    """Запрос к API OLX. Возвращает (список объявлений или None, код ответа)."""
     last = None
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp = requests.get(OLX_API, params=params, headers=HEADERS, timeout=30)
             if resp.status_code == 200:
-                return resp.text, 200
-            last = resp.status_code
-        except requests.RequestException as e:
+                data = resp.json().get("data")
+                if isinstance(data, list):
+                    return data, 200
+                last = "нет данных"
+            else:
+                last = resp.status_code
+        except (requests.RequestException, ValueError) as e:
             last = type(e).__name__
         time.sleep(5 * (attempt + 1))
     return None, last
 
 
-STATE_RE = re.compile(r'window\.__PRERENDERED_STATE__\s*=\s*("(?:[^"\\]|\\.)*")', re.S)
+def search_params(url, category_id):
+    """Переводит ссылку OLX в параметры API."""
+    p = urlparse(url)
+    slug = [s for s in p.path.split("/") if s][-1]
+    region_id = REGION_IDS.get(slug)
+    if region_id is None:
+        raise ValueError(f"неизвестная область «{slug}»")
+    params = {"offset": 0, "limit": 50, "category_id": category_id,
+              "region_id": region_id, "sort_by": "created_at:desc"}
+    for k, v in parse_qsl(p.query):
+        if k in ("min_id", "reason", "search[order]", "page"):
+            continue
+        if k.startswith("search[") and k.endswith("]"):
+            params[k[7:-1]] = v
+        else:
+            params[k] = v
+    return params
 
 
-def extract_ads(page):
-    """Список объявлений со страницы. None — если страницу не удалось разобрать."""
-    m = STATE_RE.search(page)
-    if not m:
+def detect_category(state):
+    """Находит id категории «Продаж будинків» (один раз, потом берёт из памяти)."""
+    if getattr(config, "CATEGORY_ID", None):
+        return config.CATEGORY_ID
+    if state.get("category_id"):
+        return state["category_id"]
+    counts, examples = {}, {}
+    for region_id in REGION_IDS.values():
+        items, code = api_get({"query": "продам будинок", "limit": 50, "region_id": region_id})
+        if items is None:
+            print("Категория: ответ", code)
+            return None
+        for it in items:
+            cat = it.get("category") or {}
+            if isinstance(cat, dict) and cat.get("id"):
+                counts[cat["id"]] = counts.get(cat["id"], 0) + 1
+                examples.setdefault(cat["id"], []).append(it.get("title") or "")
+        time.sleep(2)
+    if not counts:
         return None
-    try:
-        data = json.loads(json.loads(m.group(1)))
-    except (ValueError, TypeError):
-        return None
-    best = []
-
-    def walk(o):
-        nonlocal best
-        if isinstance(o, list):
-            if o and all(isinstance(x, dict) and "id" in x and "title" in x and "url" in x for x in o):
-                if len(o) > len(best):
-                    best = o
-            for x in o:
-                walk(x)
-        elif isinstance(o, dict):
-            for v in o.values():
-                walk(v)
-
-    walk(data)
-    return best
+    cid = max(counts, key=counts.get)
+    state["category_id"] = cid
+    sample = "\n".join("• " + html.escape(t) for t in examples[cid][:3])
+    tg_send(f"🔧 Определила категорию «Продажа домов»: id {cid}. Примеры:\n{sample}\n"
+            f"Если это не дома на продажу — напишите Claude.")
+    return cid
 
 
 def strip_html(s):
@@ -340,12 +360,18 @@ def params_text(params):
             val = val.get("label") or val.get("value") or val.get("key") or ""
         if not val:
             val = p.get("normalizedValue") or ""
+        if p.get("key") == "price":
+            continue
         out.append(f"{p.get('name') or p.get('key') or ''}: {val}")
     return "\n".join(out)
 
 
 def ad_info(ad):
     price = "цена не указана"
+    for p in ad.get("params") or []:
+        if isinstance(p, dict) and p.get("key") == "price" and isinstance(p.get("value"), dict):
+            v = p["value"]
+            price = v.get("label") or f"{v.get('value', '')} {v.get('currency', '')}".strip() or price
     pr = ad.get("price")
     if isinstance(pr, dict):
         rp = pr.get("regularPrice") or {}
@@ -467,11 +493,24 @@ def main():
 
     new = {}  # id -> {"info":..., "labels": [...]}
     total_ads = 0
+    category_id = detect_category(state)
+    if not category_id:
+        if state["errors"].get("category") != today:
+            tg_send("⚠️ OLX не отвечает (не удалось определить категорию). Напишите Claude.")
+            state["errors"]["category"] = today
+        if not first_run:
+            save_state(state)
+        sys.exit(1)
+
     for i, (label, url) in enumerate(config.SEARCHES):
         if i:
-            time.sleep(random.uniform(3, 6))
-        page, code = fetch(normalize_url(url))
-        ads = extract_ads(page) if page else None
+            time.sleep(random.uniform(2, 4))
+        try:
+            params = search_params(url, category_id)
+        except ValueError as e:
+            tg_send(f"⚠️ Поиск «{html.escape(label)}»: {html.escape(str(e))}. Напишите Claude.")
+            continue
+        ads, code = api_get(params)
         if ads is None:
             print(f"[{label}] не удалось прочитать (ответ: {code})")
             if state["errors"].get(label) != today:
@@ -479,7 +518,7 @@ def main():
                         f"Если повторяется — напишите Claude.")
                 state["errors"][label] = today
             continue
-        print(f"[{label}] объявлений на странице: {len(ads)}")
+        print(f"[{label}] объявлений: {len(ads)}")
         total_ads += len(ads)
         for ad in ads:
             info = ad_info(ad)
