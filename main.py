@@ -2,6 +2,7 @@
 OLX → Telegram: новые объявления о продаже домов с оценкой удобств.
 Этот файл менять не нужно. Все настройки — в config.py.
 """
+import csv
 import html
 import json
 import os
@@ -13,6 +14,7 @@ from datetime import date
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
+from curl_cffi import requests as cffi
 
 import config
 
@@ -46,9 +48,22 @@ HIDE = [
     ("без фундамента", r"без\s+фундамент"),
 ]
 
-TOILET_OUT = (r"(?:зручност|удобств)\w*\s+(?:на\s+)?(?:вулиц|улиц|двор|подвір)|"
-              r"(?:туалет|санвузол|санузел)\w*\s+(?:на\s+)?(?:вулиц|улиц|двор|подвір)|"
-              r"(?:вуличн|уличн|дворов)\w*\s+туалет|без\s+зручностей|без\s+удобств")
+# Аренда, случайно попавшая в продажу
+RENT_TITLE = r"оренд|аренд|\bзда[мює]|\bсда[мюё]|подобов|посуточ|найм"
+RENT_TEXT = (r"\bздам\b|\bздаю\b|\bсдам\b|\bсдаю\b|довгостроков\w*\s+оренд|"
+             r"долгосрочн\w*\s+аренд|подобово|посуточно|оренда\s+на\s+(?:тривал|довг)|"
+             r"грн\s*/\s*(?:міс|мес)|на\s+місяць|в\s+месяц|за\s+місяць|за\s+месяц")
+
+TOILET_WORDS = r"(?:туалет|санвуз|сануз|зручност|удобств|вбиральн|убиральн|уборн|с/в)"
+OUT_PLACE = (r"(?:надвор|на\s+вулиц|на\s+улиц|(?:на|у|в|во)\s+двор|(?:на|у|в)\s+подвір|"
+             r"(?:на|во)\s+подвор|окремо\s+від\s+будинк|отдельно\s+от\s+дома)")
+TOILET_OUT = (r"(?:зручност|удобств|туалет|санвузол|санвузл|санузел|санузл|вбиральн|уборн)\w*"
+              r"(?:[\s,:;\-–—]+[\w/]+){0,4}?[\s,:;\-–—]+(?:на|у|в|во|біля|возле|около)?\s*"
+              r"(?:вулиц|улиц|двор|подвір|надвор|надвір)|"
+              r"(?:надвір|надвор|дворов|вуличн|уличн)\w*\s+(?:\w+\s+)?(?:туалет|санвузол|санузел|вбиральн|уборн)|"
+              r"без\s+зручностей|без\s+удобств")
+TOILET_IN_HOUSE = (TOILET_WORDS + r"\w*(?:\s+[\w/]+){0,3}?\s+(?:в|у|всередині|внутри|внутрі)\s+"
+                   r"(?:будинк|будинок|доме|дому|дом\b|хат)")
 TOILET_IN = (r"санвузол|санвузл|санузел|санузл|с/в|туалет|\bванн[аоуіиыйяюі]|"
              r"\bванная|\bдушов|\bдуш\b|(?:зручност|удобств)\w*\s+(?:в|у)\s+(?:будинк|доме|хат)")
 GAS = r"\bгаз(?!о?блок|обетон|он\b|он[аиу]|ет)|газифік|газифиц"
@@ -155,6 +170,11 @@ def analyze(text):
             r["hide"] = label
             return r
 
+    title = t.split("\n", 1)[0]
+    if found(title, RENT_TITLE) or found(t, RENT_TEXT):
+        r["hide"] = "аренда"
+        return r
+
     def mark(label, st, weight, qkey):
         if st == 1:
             r["score"] += weight
@@ -171,7 +191,9 @@ def analyze(text):
     water = status(t, WATER)
 
     # Санузел
-    if found(t, TOILET_OUT):
+    if found(t, TOILET_IN_HOUSE) and status(t, TOILET_IN_HOUSE) == 1:
+        mark("Санузел в доме", 1, 3, None)
+    elif found(t, TOILET_OUT):
         r["marks"].append("🚽 Санузел во дворе")
         if water == 1:
             r["score"] -= 1
@@ -279,11 +301,13 @@ REGION_IDS = {"pol": 15, "chk": 12, "kir": 7, "vin": 24}
 
 
 def api_get(params):
-    """Запрос к API OLX. Возвращает (список объявлений или None, код ответа)."""
+    """Запрос к API OLX (притворяется браузером Chrome). Возвращает (объявления или None, код)."""
     last = None
     for attempt in range(3):
         try:
-            resp = requests.get(OLX_API, params=params, headers=HEADERS, timeout=30)
+            resp = cffi.get(OLX_API, params=params, impersonate="chrome", timeout=30,
+                            headers={"Accept": "application/json",
+                                     "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8"})
             if resp.status_code == 200:
                 data = resp.json().get("data")
                 if isinstance(data, list):
@@ -291,10 +315,24 @@ def api_get(params):
                 last = "нет данных"
             else:
                 last = resp.status_code
-        except (requests.RequestException, ValueError) as e:
+        except Exception as e:
             last = type(e).__name__
         time.sleep(5 * (attempt + 1))
     return None, last
+
+
+def is_sale_price(item):
+    """Цена похожа на продажу, а не на аренду."""
+    for p in item.get("params") or []:
+        if isinstance(p, dict) and p.get("key") == "price" and isinstance(p.get("value"), dict):
+            v = p["value"]
+            try:
+                amount = float(v.get("value") or 0)
+            except (TypeError, ValueError):
+                return False
+            cur = v.get("currency")
+            return (cur == "UAH" and amount >= 60000) or (cur in ("USD", "EUR") and amount >= 1500)
+    return False
 
 
 def search_params(url, category_id):
@@ -330,7 +368,7 @@ def detect_category(state):
             return None
         for it in items:
             cat = it.get("category") or {}
-            if isinstance(cat, dict) and cat.get("id"):
+            if isinstance(cat, dict) and cat.get("id") and is_sale_price(it):
                 counts[cat["id"]] = counts.get(cat["id"], 0) + 1
                 examples.setdefault(cat["id"], []).append(it.get("title") or "")
         time.sleep(2)
@@ -362,7 +400,10 @@ def params_text(params):
             val = p.get("normalizedValue") or ""
         if p.get("key") == "price":
             continue
-        out.append(f"{p.get('name') or p.get('key') or ''}: {val}")
+        name = p.get("name") or p.get("key") or ""
+        if str(p.get("key", "")).startswith("bathroom"):
+            name = "Санвузол"
+        out.append(f"{name}: {val}")
     return "\n".join(out)
 
 
@@ -407,14 +448,20 @@ def ad_info(ad):
 #  Telegram
 # ---------------------------------------------------------------------------
 
-def tg_send(text, photo=None, url=None):
+def tg_send(text, photo=None, url=None, ad_id=None):
     payload = {"chat_id": TG_CHAT, "text": text[:4000], "parse_mode": "HTML",
                "link_preview_options": {"is_disabled": True}}
     if photo:
         payload["link_preview_options"] = {"url": photo, "prefer_large_media": True,
                                            "show_above_text": True}
+    rows = []
     if url:
-        payload["reply_markup"] = {"inline_keyboard": [[{"text": "Открыть на OLX", "url": url}]]}
+        rows.append([{"text": "Открыть на OLX", "url": url}])
+    if ad_id:
+        rows.append([{"text": "👎 Не нравится", "callback_data": f"h:{ad_id}"},
+                     {"text": "⚠️ Ошибка бота", "callback_data": f"e:{ad_id}"}])
+    if rows:
+        payload["reply_markup"] = {"inline_keyboard": rows}
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     for _ in range(3):
         try:
@@ -435,6 +482,70 @@ def tg_send(text, photo=None, url=None):
             continue
         return False
     return False
+
+
+def tg_api(method, payload):
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", json=payload, timeout=30)
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def process_buttons(state):
+    """Обрабатывает нажатия «Скрыть» и «Ошибка бота»."""
+    state.setdefault("hidden", [])
+    state.setdefault("sent", {})
+    upd = tg_api("getUpdates", {"offset": state.get("tg_offset", 0), "timeout": 0,
+                                "allowed_updates": ["callback_query"]})
+    if not upd or not upd.get("ok"):
+        return
+    hidden = set(state["hidden"])
+    for u in upd.get("result", []):
+        state["tg_offset"] = u["update_id"] + 1
+        cq = u.get("callback_query")
+        if not cq or str((cq.get("from") or {}).get("id")) != TG_CHAT:
+            continue
+        action, _, ad_id = (cq.get("data") or "").partition(":")
+        if action not in ("h", "e") or not ad_id:
+            continue
+        if ad_id not in hidden:
+            state["hidden"].append(ad_id)
+            hidden.add(ad_id)
+        info = state["sent"].get(ad_id, {})
+        if action == "h":
+            new_file = not os.path.exists("archive.csv")
+            with open("archive.csv", "a", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(["Дата", "Заголовок", "Цена", "Место", "Баллы", "Ссылка", "Пометки"])
+                w.writerow([date.today().isoformat(), info.get("title", ""), info.get("price", ""),
+                            info.get("place", ""), info.get("score", ""),
+                            info.get("url", "id " + ad_id), info.get("marks", "")])
+        if action == "e":
+            with open("errors.txt", "a", encoding="utf-8") as f:
+                f.write(f"\n===== {date.today().isoformat()} =====\n"
+                        f"{info.get('url', 'id ' + ad_id)}\n"
+                        f"Бот показал: {info.get('marks', '')}\n"
+                        f"Текст объявления:\n{info.get('text', '')}\n")
+        tg_api("answerCallbackQuery", {"callback_query_id": cq["id"],
+                                       "text": "В архиве" if action == "h" else "Записано в errors.txt"})
+        msg = cq.get("message") or {}
+        if msg.get("message_id"):
+            tg_api("deleteMessage", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"]})
+        print(("Не нравится: " if action == "h" else "Ошибка: ") + ad_id)
+    state["hidden"] = state["hidden"][-SEEN_LIMIT:]
+
+
+def send_card(state, item, a):
+    info = item["info"]
+    tg_send(card(info, item["labels"], a), info["photo"], info["url"], info["id"])
+    sent = state.setdefault("sent", {})
+    sent[info["id"]] = {"url": info["url"], "text": info["text"][:2000], "title": info["title"],
+                        "price": info["price"], "place": info["place"], "score": a["score"],
+                        "marks": " | ".join(a["marks"] + [a["walls"], a["found"]])}
+    for old in list(sent)[:-300]:
+        del sent[old]
 
 
 def card(info, labels, a):
@@ -488,7 +599,8 @@ def main():
     first_run = state is None
     if first_run:
         state = {"seen": [], "errors": {}}
-    seen = set(state["seen"])
+    process_buttons(state)
+    seen = set(state["seen"]) | set(state.get("hidden", []))
     today = date.today().isoformat()
 
     new = {}  # id -> {"info":..., "labels": [...]}
@@ -551,7 +663,7 @@ def main():
                 f"Присылаю {len(to_send)} лучших, дальше — только новые.")
 
     for score, item, a in to_send:
-        tg_send(card(item["info"], item["labels"], a), item["info"]["photo"], item["info"]["url"])
+        send_card(state, item, a)
         time.sleep(1.2)
 
     if not first_run and len(results) > limit:
