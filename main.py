@@ -10,7 +10,7 @@ import random
 import re
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
@@ -458,6 +458,7 @@ def tg_send(text, photo=None, url=None, ad_id=None):
     if url:
         rows.append([{"text": "Открыть на OLX", "url": url}])
     if ad_id:
+        rows.append([{"text": "⭐ Нравится", "callback_data": f"f:{ad_id}"}])
         rows.append([{"text": "👎 Не нравится", "callback_data": f"h:{ad_id}"},
                      {"text": "⚠️ Ошибка бота", "callback_data": f"e:{ad_id}"}])
     if rows:
@@ -497,18 +498,34 @@ def process_buttons(state):
     state.setdefault("hidden", [])
     state.setdefault("sent", {})
     upd = tg_api("getUpdates", {"offset": state.get("tg_offset", 0), "timeout": 0,
-                                "allowed_updates": ["callback_query"]})
+                                "allowed_updates": ["callback_query", "message"]})
     if not upd or not upd.get("ok"):
-        return
+        return False
     hidden = set(state["hidden"])
+    want_best = False
     for u in upd.get("result", []):
         state["tg_offset"] = u["update_id"] + 1
+        m = u.get("message") or {}
+        if str((m.get("from") or {}).get("id")) == TG_CHAT:
+            cmd = (m.get("text") or "").strip().lower()
+            if cmd in (BEST_BUTTON.lower(), "/best"):
+                want_best = True
+            elif cmd in (FAV_BUTTON.lower(), "/fav"):
+                send_favorites(state)
+            continue
         cq = u.get("callback_query")
         if not cq or str((cq.get("from") or {}).get("id")) != TG_CHAT:
             continue
         action, _, ad_id = (cq.get("data") or "").partition(":")
+        if action == "f" and ad_id:
+            add_favorite(state, ad_id, cq)
+            continue
+        if action == "x":
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Уже в избранном"})
+            continue
         if action not in ("h", "e") or not ad_id:
             continue
+        state.setdefault("favorites", {}).pop(ad_id, None)
         if ad_id not in hidden:
             state["hidden"].append(ad_id)
             hidden.add(ad_id)
@@ -535,6 +552,64 @@ def process_buttons(state):
             tg_api("deleteMessage", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"]})
         print(("Не нравится: " if action == "h" else "Ошибка: ") + ad_id)
     state["hidden"] = state["hidden"][-SEEN_LIMIT:]
+    return want_best
+
+
+FAV_BUTTON = "⭐ Избранное"
+KEYBOARD = {"keyboard": [[{"text": "🏆 Лучшие"}, {"text": FAV_BUTTON}]],
+            "resize_keyboard": True, "is_persistent": True}
+
+
+def add_favorite(state, ad_id, cq):
+    info = state.setdefault("sent", {}).get(ad_id, {})
+    favs = state.setdefault("favorites", {})
+    if ad_id not in favs:
+        favs[ad_id] = {"date": date.today().isoformat(), "title": info.get("title", ""),
+                       "price": info.get("price", ""), "place": info.get("place", ""),
+                       "score": info.get("score", ""), "url": info.get("url", "")}
+        new_file = not os.path.exists("favorites.csv")
+        with open("favorites.csv", "a", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["Дата", "Заголовок", "Цена", "Место", "Баллы", "Ссылка", "Пометки"])
+            w.writerow([date.today().isoformat(), info.get("title", ""), info.get("price", ""),
+                        info.get("place", ""), info.get("score", ""),
+                        info.get("url", "id " + ad_id), info.get("marks", "")])
+    tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "Добавлено в избранное"})
+    msg = cq.get("message") or {}
+    if msg.get("message_id"):
+        rows = []
+        if info.get("url"):
+            rows.append([{"text": "Открыть на OLX", "url": info["url"]}])
+        rows.append([{"text": "⭐ В избранном", "callback_data": "x:"}])
+        rows.append([{"text": "👎 Не нравится", "callback_data": f"h:{ad_id}"},
+                     {"text": "⚠️ Ошибка бота", "callback_data": f"e:{ad_id}"}])
+        tg_api("editMessageReplyMarkup", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
+                                          "reply_markup": {"inline_keyboard": rows}})
+    print("Нравится: " + ad_id)
+
+
+def send_favorites(state):
+    favs = state.get("favorites", {})
+    if not favs:
+        tg_api("sendMessage", {"chat_id": TG_CHAT, "reply_markup": KEYBOARD,
+                               "text": "⭐ В избранном пока пусто."})
+        return
+    lines = [f"⭐ <b>Избранное ({len(favs)})</b>"]
+    for i, (ad_id, f) in enumerate(favs.items(), 1):
+        title = html.escape(f.get("title") or f"объявление {ad_id}")
+        link = f'<a href="{html.escape(f["url"])}">{title}</a>' if f.get("url") else title
+        extra = " · ".join(x for x in (f.get("price"), f.get("place")) if x)
+        lines.append(f"{i}. {link}" + (f" — {html.escape(extra)}" if extra else ""))
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) > 3800:
+            tg_api("sendMessage", {"chat_id": TG_CHAT, "text": chunk, "parse_mode": "HTML",
+                                   "link_preview_options": {"is_disabled": True}, "reply_markup": KEYBOARD})
+            chunk = ""
+        chunk += line + "\n"
+    tg_api("sendMessage", {"chat_id": TG_CHAT, "text": chunk, "parse_mode": "HTML",
+                           "link_preview_options": {"is_disabled": True}, "reply_markup": KEYBOARD})
 
 
 def send_card(state, item, a):
@@ -546,6 +621,10 @@ def send_card(state, item, a):
                         "marks": " | ".join(a["marks"] + [a["walls"], a["found"]])}
     for old in list(sent)[:-300]:
         del sent[old]
+    shown = state.setdefault("shown", [])
+    if info["id"] not in shown:
+        shown.append(info["id"])
+    state["shown"] = shown[-SEEN_LIMIT:]
 
 
 def card(info, labels, a):
@@ -590,6 +669,109 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False)
 
 
+BEST_BUTTON = "🏆 Лучшие"
+BEST_CACHE = "best_cache.json"
+
+
+def collect_period(category_id, days):
+    """Все объявления за период по всем поискам (с кэшем на 6 часов)."""
+    if os.path.exists(BEST_CACHE):
+        try:
+            with open(BEST_CACHE, encoding="utf-8") as f:
+                cache = json.load(f)
+            if cache.get("days") == days and time.time() - cache.get("ts", 0) < 6 * 3600:
+                print("Беру объявления из кэша")
+                return cache["items"]
+        except (ValueError, OSError):
+            pass
+    items, cutoff = {}, None
+    for label, url in config.SEARCHES:
+        try:
+            params = search_params(url, category_id)
+        except ValueError:
+            continue
+        offset = 0
+        while offset < 1000:
+            params["offset"] = offset
+            ads, code = api_get(params)
+            if not ads:
+                if ads is None:
+                    print(f"[{label}] ошибка: {code}")
+                break
+            too_old = False
+            for ad in ads:
+                try:
+                    created = datetime.fromisoformat(ad.get("created_time"))
+                except (TypeError, ValueError):
+                    continue
+                if cutoff is None:
+                    cutoff = datetime.now(created.tzinfo) - timedelta(days=days)
+                if created < cutoff:
+                    too_old = True
+                    continue
+                info = ad_info(ad)
+                if info["id"] in items:
+                    if label not in items[info["id"]]["labels"]:
+                        items[info["id"]]["labels"].append(label)
+                else:
+                    items[info["id"]] = {"info": info, "labels": [label],
+                                         "created": ad.get("created_time")}
+            print(f"[{label}] страница {offset // 50 + 1}: {len(ads)}")
+            if too_old or len(ads) < 50:
+                break
+            offset += 50
+            time.sleep(random.uniform(1.5, 3))
+        time.sleep(2)
+    with open(BEST_CACHE, "w", encoding="utf-8") as f:
+        json.dump({"days": days, "ts": time.time(), "items": items}, f, ensure_ascii=False)
+    return items
+
+
+def send_best(state, category_id, count=20, days=90):
+    """Присылает count лучших за days дней, которые ещё ни разу не показывались."""
+    items = collect_period(category_id, days)
+    skip = set(state.get("shown", [])) | set(state.get("hidden", [])) | set(state.get("sent", {}))
+    results = []
+    for ad_id, item in items.items():
+        if ad_id in skip:
+            continue
+        a = analyze(item["info"]["text"])
+        if not a["hide"]:
+            results.append((a["score"], item.get("created") or "", item, a))
+    results.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    batch = results[:count]
+    left = len(results) - len(batch)
+    keyboard = KEYBOARD
+    if not batch:
+        tg_api("sendMessage", {"chat_id": TG_CHAT, "reply_markup": keyboard,
+                               "text": f"🏆 Непоказанных подходящих объявлений за {days} дн. не осталось."})
+        return
+    tg_api("sendMessage", {"chat_id": TG_CHAT, "reply_markup": keyboard, "parse_mode": "HTML",
+                           "text": f"🏆 <b>{len(batch)} лучших за {days} дн.</b> — от лучших к худшим.\n"
+                                   f"Непоказанных подходящих осталось ещё: {left}."})
+    for score, created, item, a in batch:
+        send_card(state, item, a)
+        time.sleep(1.2)
+    for ad_id in items:
+        if ad_id not in state["seen"]:
+            state["seen"].append(ad_id)
+
+
+def run_best(count, days):
+    if not TG_TOKEN or not TG_CHAT:
+        print("Нет TELEGRAM_TOKEN или TELEGRAM_CHAT_ID в Secrets")
+        sys.exit(1)
+    state = load_state() or {"seen": [], "errors": {}}
+    process_buttons(state)
+    category_id = detect_category(state)
+    if not category_id:
+        tg_send("⚠️ OLX не отвечает. Попробуйте позже.")
+        save_state(state)
+        sys.exit(1)
+    send_best(state, category_id, count, days)
+    save_state(state)
+
+
 def main():
     if not TG_TOKEN or not TG_CHAT:
         print("Нет TELEGRAM_TOKEN или TELEGRAM_CHAT_ID в Secrets")
@@ -599,7 +781,7 @@ def main():
     first_run = state is None
     if first_run:
         state = {"seen": [], "errors": {}}
-    process_buttons(state)
+    want_best = process_buttons(state)
     seen = set(state["seen"]) | set(state.get("hidden", []))
     today = date.today().isoformat()
 
@@ -670,9 +852,16 @@ def main():
         tg_send(f"ℹ️ Ещё {len(results) - limit} новых объявлений с меньшими баллами не показаны.")
 
     state["seen"].extend(new.keys())
+    if want_best:
+        send_best(state, category_id, getattr(config, "BEST_COUNT", 20), getattr(config, "BEST_DAYS", 90))
     save_state(state)
     print(f"Новых: {len(new)}, отправлено: {len(to_send)}")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "best":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 20
+        d = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 90
+        run_best(n, d)
+    else:
+        main()
