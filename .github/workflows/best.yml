@@ -1,0 +1,49 @@
+name: Best 20
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Сколько объявлений прислать"
+        default: "20"
+      days:
+        description: "За сколько дней"
+        default: "90"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: olx-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: python main.py best "${{ inputs.count }}" "${{ inputs.days }}"
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Save seen ads
+        if: always()
+        run: |
+          git config user.name "olx-bot"
+          git config user.email "olx-bot@users.noreply.github.com"
+          for f in seen.json archive.csv errors.txt favorites.csv best_cache.json; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          git diff --cached --quiet || git commit -m "update bot data"
+          git push
