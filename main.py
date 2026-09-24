@@ -297,7 +297,7 @@ def analyze(text):
 OLX_API = "https://www.olx.ua/api/v1/offers/"
 
 # Области OLX: кусок ссылки -> id
-REGION_IDS = {"pol": 15, "chk": 12, "kir": 7, "vin": 24}
+REGION_IDS = {"pol": 15, "chk": 12, "kir": 7, "vin": 24, "ko": 25, "zht": 6}
 
 
 def api_get(params):
@@ -335,11 +335,29 @@ def is_sale_price(item):
     return False
 
 
-def search_params(url, category_id):
+def split_search(entry):
+    """("Название", "ссылка", {доп. условия}) -> label, url, opts"""
+    return entry[0], entry[1], (entry[2] if len(entry) > 2 and isinstance(entry[2], dict) else {})
+
+
+def passes(ad, opts):
+    """Доп. условия поиска, например южнее определённой широты."""
+    max_lat = opts.get("max_lat")
+    if max_lat is not None:
+        try:
+            lat = float((ad.get("map") or {}).get("lat"))
+        except (TypeError, ValueError):
+            return True
+        if lat > max_lat:
+            return False
+    return True
+
+
+def search_params(url, category_id, opts=None):
     """Переводит ссылку OLX в параметры API."""
     p = urlparse(url)
     slug = [s for s in p.path.split("/") if s][-1]
-    region_id = REGION_IDS.get(slug)
+    region_id = (opts or {}).get("region_id") or REGION_IDS.get(slug)
     if region_id is None:
         raise ValueError(f"неизвестная область «{slug}»")
     params = {"offset": 0, "limit": 50, "category_id": category_id,
@@ -679,15 +697,17 @@ def collect_period(category_id, days):
         try:
             with open(BEST_CACHE, encoding="utf-8") as f:
                 cache = json.load(f)
-            if cache.get("days") == days and time.time() - cache.get("ts", 0) < 6 * 3600:
+            if cache.get("days") == days and cache.get("searches") == repr(config.SEARCHES) \
+                    and time.time() - cache.get("ts", 0) < 6 * 3600:
                 print("Беру объявления из кэша")
                 return cache["items"]
         except (ValueError, OSError):
             pass
     items, cutoff = {}, None
-    for label, url in config.SEARCHES:
+    for entry in config.SEARCHES:
+        label, url, opts = split_search(entry)
         try:
-            params = search_params(url, category_id)
+            params = search_params(url, category_id, opts)
         except ValueError:
             continue
         offset = 0
@@ -709,6 +729,8 @@ def collect_period(category_id, days):
                 if created < cutoff:
                     too_old = True
                     continue
+                if not passes(ad, opts):
+                    continue
                 info = ad_info(ad)
                 if info["id"] in items:
                     if label not in items[info["id"]]["labels"]:
@@ -723,7 +745,8 @@ def collect_period(category_id, days):
             time.sleep(random.uniform(1.5, 3))
         time.sleep(2)
     with open(BEST_CACHE, "w", encoding="utf-8") as f:
-        json.dump({"days": days, "ts": time.time(), "items": items}, f, ensure_ascii=False)
+        json.dump({"days": days, "ts": time.time(), "searches": repr(config.SEARCHES),
+                   "items": items}, f, ensure_ascii=False)
     return items
 
 
@@ -796,11 +819,12 @@ def main():
             save_state(state)
         sys.exit(1)
 
-    for i, (label, url) in enumerate(config.SEARCHES):
+    for i, entry in enumerate(config.SEARCHES):
+        label, url, opts = split_search(entry)
         if i:
             time.sleep(random.uniform(2, 4))
         try:
-            params = search_params(url, category_id)
+            params = search_params(url, category_id, opts)
         except ValueError as e:
             tg_send(f"⚠️ Поиск «{html.escape(label)}»: {html.escape(str(e))}. Напишите Claude.")
             continue
@@ -815,6 +839,8 @@ def main():
         print(f"[{label}] объявлений: {len(ads)}")
         total_ads += len(ads)
         for ad in ads:
+            if not passes(ad, opts):
+                continue
             info = ad_info(ad)
             if info["id"] in seen or not info["url"]:
                 continue
