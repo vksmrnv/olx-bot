@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - uses: actions/setup-python@v5
         with:
@@ -35,7 +37,7 @@ jobs:
         run: |
           git config user.name "olx-bot"
           git config user.email "olx-bot@users.noreply.github.com"
-          for f in seen.json archive.csv errors.txt; do
+          for f in seen.json archive.csv errors.txt favorites.csv best_cache.json; do
             if [ -f "$f" ]; then git add "$f"; fi
           done
           git diff --cached --quiet || git commit -m "update bot data"
