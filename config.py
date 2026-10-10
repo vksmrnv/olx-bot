@@ -16,7 +16,8 @@ SEARCHES = [
     ("Киевская (юг) · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/ko/?currency=USD&search%5Bfilter_float_price%3Ato%5D=6500", {"max_lat": 50.30}),
     ("Житомирская (юг) · до 350 000 грн", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/zht/?currency=UAH&search%5Bfilter_float_price%3Ato%5D=350000", {"max_lat": 50.20, "region_id": 6}),
     ("Житомирская (юг) · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/zht/?currency=USD&search%5Bfilter_float_price%3Ato%5D=6500", {"max_lat": 50.20, "region_id": 6}),
-
+    ("Харьковская (юго-запад) · до 350 000 грн", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/kha/?currency=UAH&search%5Bfilter_float_price%3Ato%5D=350000", {"max_lat": 49.60, "max_lon": 35.95, "region_id": 8, "strict": True}),
+    ("Харьковская (юго-запад) · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/kha/?currency=USD&search%5Bfilter_float_price%3Ato%5D=6500", {"max_lat": 49.60, "max_lon": 35.95, "region_id": 8, "strict": True}),
 ]
 
 # С какого количества баллов ставить 🔥
