@@ -86,9 +86,10 @@ TOILET_IN = (r"санвузол|санвузл|санузел|санузл|с/в
              r"\bванная|\bдушов|\bдуш\b|(?:зручност|удобств)\w*\s+(?:в|у)\s+(?:будинк|доме|хат)")
 GAS = r"\bгаз(?!о?блок|обетон|он\b|он[аиу]|ет)|газифік|газифиц"
 HEAT = r"опален|отоплен|котел|котла|котлом|котёл|тепла\s+підлог|теплый\s+пол|теплі\s+підлог"
-WATER = (r"\bвод(?:а|и|у|ою|ой|опровід|опровод|опостач|оснабж)\b|водопровід|водопровод|"
+WATER = (r"\bвод(?:а|и|ы|у|ою|ой|опровід|опровод|опостач|оснабж)\b|водопровід|водопровод|"
          r"свердловин|скважин|колодяз|колодец|колодц|криниц")
-LIGHT = r"світло\b|\bсвет\b|електр|электр"
+LIGHT = (r"\bсвітло\b|\bсвет\b|(?<=без )світла|(?<=без )света|\bсвітла(?=\s+(?:немає|нема|нет|не\b))|"
+         r"\bсвета(?=\s+(?:нет|не\b))|електр|электр")
 DOCS = (r"документ|право\s+власн|право\s+собствен|кадастр|приватизован|приватизирован|"
         r"витяг|выписк|техпаспорт|технічн\w*\s+паспорт|свідоцтв|свидетельств")
 
@@ -169,11 +170,116 @@ def found(t, pat):
     return re.search(pat, t) is not None
 
 
+# --- Разбор фразы вокруг слова (газ, вода, свет...) -------------------------
+_NEG = re.compile(r"^(?:немає|нема|нема[єе]|нет|нету|відсутн\w*|отсутств\w*|ні|нi|ани|ані)$")
+_NEG_LEFT = re.compile(r"^(?:без|немає|нема|нет|нету|відсутн\w*|отсутств\w*|ні|нi|ані|ни)$")
+_POS = re.compile(r"^(?:є|есть|присутн\w*|наявн\w*|заведен\w*|підведен\w*|подведен\w*|підключен\w*|"
+                  r"подключен\w*|проведен\w*|наявності)$")
+_NOUN_FORM = re.compile(r"(?:ння|ние|ния)$")      # підключення, проведение — не «есть»
+_NEAR = re.compile(r"^(?:вулиц\w*|улиц\w*|поруч|поряд|рядом|біля|возле|около|вздовж|вдоль|межі|колонк\w*|колонц\w*|"
+                   r"можливість|возможность|можна|можно|перспектив\w*|недалеко|неподалік)$")
+_UTIL = re.compile(r"^(?:газ\w*|вод\w*|світл\w*|свет\w*|електр\w*|электр\w*|каналізац\w*|канализац\w*|опален\w*|"
+                   r"отоплен\w*|інтернет\w*|интернет\w*|комунікац\w*|коммуникац\w*|зручност\w*|удобств\w*|"
+                   r"свердловин\w*|скважин\w*|криниц\w*|колодяз\w*|колод\w*|септик\w*|центральн\w*|природн\w*|"
+                   r"магістральн\w*|питн\w*|гаряч\w*|горяч\w*|холодн\w*|санвуз\w*|сануз\w*|туалет\w*|душ\w*|ванн\w*)$")
+_WEAK_NEAR = re.compile(r"^(?:труб\w*|проход\w*)$")
+_CONJ = re.compile(r"^(?:і|й|та|и|а|також|ще|або|чи|теж|тоже|ні|ани|ані)$")
+_PLACE = re.compile(r"^(?:в|у|во|до|на|будинку|будинок|будинок|доме|дом|дому|хаті|хату|хата|всередині|внутри|"
+                    r"ділянці|участке|самому|самом|самій)$")
+_TOK = re.compile(r"\w+(?:'\w+)?|[,:/\-–—]")
+
+
+def _scan(tokens, left):
+    """Идёт от слова влево/вправо по фразе. Возвращает 'neg' / 'pos' / 'near' / None."""
+    own = False
+    crossed = False      # прошли запятую
+    util_after = False   # после запятой был ещё один пункт списка («немає газу, води»)
+    unknown = 0
+    weak = False
+    for i, tok in enumerate(tokens[:9]):
+        if tok in (",", "/"):
+            if own:
+                return "near" if weak else None
+            crossed = True
+            continue
+        if tok in (":", "-", "–", "—"):
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if left:
+            if _NEG_LEFT.match(tok):
+                if crossed and not util_after:
+                    return None          # «газ відсутній, вода…» — «відсутній» про газ, не про воду
+                return "neg"
+            if _POS.match(tok) and not _NOUN_FORM.search(tok):
+                if nxt == "не":
+                    return None if crossed and not util_after else "neg"
+                return None if crossed else "pos"
+            if _NEAR.match(tok):
+                if crossed or (tok.startswith("колонк") and nxt.startswith("газов")):
+                    return None
+                return "near"
+        else:
+            neg_here = _NEG.match(tok) or (tok == "не" and (_POS.match(nxt) or nxt.startswith(
+                ("підвед", "подвед", "підключ", "подключ", "провед", "завед", "має", "имее", "буде"))))
+            if neg_here:
+                return None if crossed and not util_after else "neg"
+            if _POS.match(tok) and not _NOUN_FORM.search(tok):
+                return None if crossed else "pos"
+            if _NEAR.match(tok):
+                return None if crossed else "near"
+        if _WEAK_NEAR.match(tok) and not crossed:
+            weak = True
+            continue
+        if _CONJ.match(tok):
+            continue
+        if _UTIL.match(tok):
+            if crossed:
+                util_after = True
+            continue
+        if _PLACE.match(tok):
+            own = True
+            continue
+        own = True
+        unknown += 1
+        if unknown > 2:
+            return "near" if weak else None
+    return "near" if weak else None
+
+
 def status(t, pat):
-    """1 = есть, -1 = явно нет, 0 = не упомянуто"""
-    if found(t, NEG_BEFORE + "(?:" + pat + ")") or found(t, "(?:" + pat + ")" + NEG_AFTER):
+    """1 = есть, -1 = явно нет, 2 = только рядом/по улице (в дом не заведено), 0 = не упомянуто"""
+    neg = near = pos_explicit = pos_plain = 0
+    for m in re.finditer(pat, t):
+        start = max(t.rfind(ch, 0, m.start()) for ch in ".!?;\n") + 1
+        ends = [e for e in (t.find(ch, m.end()) for ch in ".!?;\n") if e != -1]
+        end = min(ends) if ends else len(t)
+        word_tail = re.match(r"\w*", t[m.end():end]).group(0)
+        if (m.group(0) + word_tail).startswith("газов") and re.match(
+                r"\s*(?:котел|котла|котлом|котёл|плит|колонк|опален|отоплен|конвектор|лічильник|счетчик)",
+                t[m.end() + len(word_tail):]):
+            pos_plain += 1          # газовий котел, газова плита — газ есть
+            continue
+        left = _TOK.findall(t[start:m.start()])[::-1]
+        right = _TOK.findall(t[m.end() + len(word_tail):end])
+        r_res, l_res = _scan(right, False), _scan(left, True)
+        res = next((x for x in ("neg", "pos", "near") if x in (r_res, l_res)), None)
+        if res == "neg":
+            neg += 1
+        elif res == "near":
+            near += 1
+        elif res == "pos":
+            pos_explicit += 1
+        else:
+            pos_plain += 1
+    if neg and pos_explicit:
+        return 0            # противоречие — пусть будет «уточнить»
+    if neg:
         return -1
-    return 1 if found(t, pat) else 0
+    if pos_explicit:
+        return 1
+    if near:
+        return 2
+    return 1 if pos_plain else 0
 
 
 PARTIAL_UNFINISHED = (r"(?:другий|второй|2-?й|верхній|верхний)\s+(?:поверх|этаж)\s+(?:\w+\s+)?(?:недобуд|недостро)\w*|"
@@ -222,6 +328,8 @@ def analyze(text):
             r["marks"].append("✖️ " + label)
             if qkey:
                 r["questions"].append(q[qkey])
+        elif st == 2:
+            r["marks"].append("🟠 " + label + " (рядом, не в доме)")
         else:
             r["marks"].append("❓ " + label)
             if qkey:
@@ -251,12 +359,18 @@ def analyze(text):
     if gas == 1:
         mark("Газ", 1, 3, None)
     elif heat == 1:
-        mark("Отопление" + (" (без газа)" if gas == -1 else ""), 1, 3, None)
+        extra = {-1: " (без газа)", 2: " (газ только по улице)"}.get(gas, "")
+        mark("Отопление" + extra, 1, 3, None)
+    elif gas == 2:
+        mark("Газ", 2, 3, "gas")
     else:
         mark("Газ/отопление", -1 if gas == -1 else 0, 3, "gas")
 
     mark("Вода", water, 3, "water")
-    mark("Свет", status(t, LIGHT), 3, "light")
+    light = status(t, LIGHT)
+    if status(t, r"\bсвітла\b|\bсвета\b") == -1:
+        light = -1 if light != 1 else 0
+    mark("Свет", light, 3, "light")
     mark("Документы", status(t, DOCS), 3, "docs")
 
     for label, pat in EXTRAS_2:
@@ -798,11 +912,9 @@ def rule_summary(a, info=None):
     good = [m[2:].strip() for m in a["marks"] if m.startswith("✅")]
     missing = [m[2:].strip() for m in a["marks"] if m.startswith("❓")]
     bad = [m[2:].strip() for m in a["marks"] if m.startswith("✖️")]
+    near = [m[2:].replace(" (рядом, не в доме)", "").strip() for m in a["marks"] if m.startswith("🟠")]
 
-    walls = a["walls"]
-    for ch in "🧱🟤⚠️❓ ":
-        walls = walls.replace(ch, "")
-    walls = walls.strip()
+    walls = re.sub(r"^[^\w]+", "", a["walls"] or "").strip()
     first = []
     if walls and "не указано" not in walls and "уточнить" not in walls:
         first.append(walls)
@@ -824,6 +936,8 @@ def rule_summary(a, info=None):
         parts.append("Плюсы: " + ", ".join(x.lower() for x in a["extras"]))
     if bad:
         parts.append("Нет: " + ", ".join(x.lower() for x in bad))
+    if near:
+        parts.append("Только рядом/по улице: " + ", ".join(x.lower() for x in near))
     if missing:
         parts.append("Не указано: " + ", ".join(x.lower() for x in missing))
     if tk.get("repair"):
