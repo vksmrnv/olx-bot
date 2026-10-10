@@ -25,3 +25,5 @@ MAX_PER_RUN = 30
 
 # Язык вопросов продавцу: "ru" или "uk"
 QUESTION_LANG = "ua"
+
+PHOTOS = 10
