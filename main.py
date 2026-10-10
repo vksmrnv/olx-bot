@@ -444,22 +444,38 @@ def ad_info(ad):
     region = loc.get("regionName") or (loc.get("region") or {}).get("name") or ""
     place = ", ".join(x for x in (city, region) if x)
 
-    photo = ""
-    photos = ad.get("photos") or []
-    if photos:
-        ph = photos[0]
+    photo_list = []
+    for ph in ad.get("photos") or []:
         if isinstance(ph, dict):
             ph = ph.get("link") or ph.get("url") or ""
-        photo = str(ph).replace("{width}", "800").replace("{height}", "600")
+        if ph:
+            photo_list.append(str(ph).replace("{width}", "1000").replace("{height}", "750"))
+    photo = photo_list[0] if photo_list else ""
+
+    tags, tag_keys = [], {}
+    for p in ad.get("params") or []:
+        if not isinstance(p, dict) or p.get("key") == "price":
+            continue
+        val = p.get("value")
+        if isinstance(val, dict):
+            val = val.get("label") or val.get("value") or val.get("key") or ""
+        name = (p.get("name") or p.get("key") or "").strip()
+        if val:
+            tags.append((name, str(val)))
+            tag_keys[str(p.get("key"))] = str(val)
 
     url = str(ad.get("url") or "")
     if url.startswith("/"):
         url = "https://www.olx.ua" + url
 
     title = str(ad.get("title") or "")
-    text = "\n".join([title, strip_html(ad.get("description")), params_text(ad.get("params"))])
+    description = strip_html(ad.get("description")).strip()
+    description = re.sub(r"\n{3,}", "\n\n", description)
+    text = "\n".join([title, description, params_text(ad.get("params"))])
     return {"id": str(ad.get("id")), "title": title, "price": price, "place": place,
-            "photo": photo, "url": url, "text": text}
+            "photo": photo, "photos": photo_list, "tags": tags, "tag_keys": tag_keys,
+            "description": description,
+            "url": url, "text": text}
 
 
 # ---------------------------------------------------------------------------
@@ -566,8 +582,11 @@ def process_buttons(state):
         tg_api("answerCallbackQuery", {"callback_query_id": cq["id"],
                                        "text": "В архиве" if action == "h" else "Записано в errors.txt"})
         msg = cq.get("message") or {}
+        to_delete = list(info.get("album") or [])
         if msg.get("message_id"):
-            tg_api("deleteMessage", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"]})
+            to_delete.append(msg["message_id"])
+        if to_delete:
+            tg_api("deleteMessages", {"chat_id": TG_CHAT, "message_ids": to_delete[:100]})
         print(("Не нравится: " if action == "h" else "Ошибка: ") + ad_id)
     state["hidden"] = state["hidden"][-SEEN_LIMIT:]
     return want_best
@@ -630,13 +649,68 @@ def send_favorites(state):
                            "link_preview_options": {"is_disabled": True}, "reply_markup": KEYBOARD})
 
 
+def tg_album(photos):
+    """Отправляет все фото альбомами по 10. Возвращает id сообщений."""
+    ids = []
+    for i in range(0, len(photos), 10):
+        chunk = photos[i:i + 10]
+        if len(chunk) == 1:
+            r = tg_api("sendPhoto", {"chat_id": TG_CHAT, "photo": chunk[0],
+                                     "disable_notification": True})
+            if r and r.get("ok"):
+                ids.append(r["result"]["message_id"])
+        else:
+            for _ in range(3):
+                r = tg_api("sendMediaGroup", {"chat_id": TG_CHAT, "disable_notification": True,
+                                              "media": [{"type": "photo", "media": p} for p in chunk]})
+                if r and r.get("ok"):
+                    ids += [m["message_id"] for m in r["result"]]
+                    break
+                retry = ((r or {}).get("parameters") or {}).get("retry_after")
+                if retry:
+                    time.sleep(int(retry) + 1)
+                    continue
+                print("Альбом не отправился:", (r or {}).get("description"))
+                break
+        time.sleep(1.5)
+    return ids
+
+
+def tg_card(text, url, ad_id):
+    rows = []
+    if url:
+        rows.append([{"text": "Открыть на OLX", "url": url}])
+    rows.append([{"text": "⭐ Нравится", "callback_data": f"f:{ad_id}"}])
+    rows.append([{"text": "👎 Не нравится", "callback_data": f"h:{ad_id}"},
+                 {"text": "⚠️ Ошибка бота", "callback_data": f"e:{ad_id}"}])
+    payload = {"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
+               "link_preview_options": {"is_disabled": True},
+               "reply_markup": {"inline_keyboard": rows}}
+    for _ in range(3):
+        r = tg_api("sendMessage", payload)
+        if r and r.get("ok"):
+            return r["result"]["message_id"]
+        retry = ((r or {}).get("parameters") or {}).get("retry_after")
+        if retry:
+            time.sleep(int(retry) + 1)
+            continue
+        print("Telegram error:", (r or {}).get("description"))
+        # запасной вариант: без оформления
+        payload.pop("parse_mode", None)
+        payload["text"] = re.sub(r"<[^>]+>", "", text)[:4000]
+    return None
+
+
 def send_card(state, item, a):
     info = item["info"]
-    tg_send(card(info, item["labels"], a), info["photo"], info["url"], info["id"])
+    summary = ai_summary(info)
+    album = tg_album((info.get("photos") or [])[:getattr(config, "PHOTOS", 5)])
+    msg_id = tg_card(card(info, item["labels"], a, summary, ai=bool(summary)), info["url"], info["id"])
     sent = state.setdefault("sent", {})
     sent[info["id"]] = {"url": info["url"], "text": info["text"][:2000], "title": info["title"],
                         "price": info["price"], "place": info["place"], "score": a["score"],
-                        "marks": " | ".join(a["marks"] + [a["walls"], a["found"]])}
+                        "marks": " | ".join(a["marks"] + [a["walls"], a["found"]]),
+                        "album": album, "card": msg_id}
     for old in list(sent)[:-300]:
         del sent[old]
     shown = state.setdefault("shown", [])
@@ -645,29 +719,116 @@ def send_card(state, item, a):
     state["shown"] = shown[-SEEN_LIMIT:]
 
 
-def card(info, labels, a):
+AI_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+_ai_off = False
+
+
+def rule_summary(a, info=None):
+    """Бесплатное саммари: короткий текст из найденных признаков и тегов OLX."""
+    tk = (info or {}).get("tag_keys") or {}
+    good = [m[2:].strip() for m in a["marks"] if m.startswith("✅")]
+    missing = [m[2:].strip() for m in a["marks"] if m.startswith("❓")]
+    bad = [m[2:].strip() for m in a["marks"] if m.startswith("✖️")]
+
+    walls = a["walls"]
+    for ch in "🧱🟤⚠️❓ ":
+        walls = walls.replace(ch, "")
+    walls = walls.strip()
+    first = []
+    if walls and "не указано" not in walls and "уточнить" not in walls:
+        first.append(walls)
+    else:
+        first.append("Дом")
+    if tk.get("total_area"):
+        first.append(tk["total_area"])
+    if tk.get("number_of_rooms"):
+        first.append(f"{tk['number_of_rooms']} комн.")
+    if tk.get("land_area"):
+        first.append("участок " + tk["land_area"])
+    parts = [", ".join(first)]
+
+    if any("Санузел во дворе" in m for m in a["marks"]):
+        bad.insert(0, "санузел в доме (он во дворе)")
+    if good:
+        parts.append("Есть: " + ", ".join(x.lower() for x in good))
+    if a["extras"]:
+        parts.append("Плюсы: " + ", ".join(x.lower() for x in a["extras"]))
+    if bad:
+        parts.append("Нет: " + ", ".join(x.lower() for x in bad))
+    if missing:
+        parts.append("Не указано: " + ", ".join(x.lower() for x in missing))
+    if tk.get("repair"):
+        parts.append("Состояние по OLX: " + tk["repair"].lower())
+    return ". ".join(parts) + "."
+
+
+def ai_summary(info):
+    """Саммари от Claude (если в Secrets есть ANTHROPIC_API_KEY). None — если не получилось."""
+    global _ai_off
+    if not AI_KEY or _ai_off:
+        return None
+    tags = "\n".join(f"{n}: {v}" for n, v in info.get("tags", []))
+    prompt = (
+        "Это объявление о продаже дома в Украине. Семья ищет дом, куда можно сразу заехать и жить "
+        "(санузел в доме, газ/отопление, вода, свет, документы, крепкие стены и фундамент), "
+        "косметический ремонт допустим.\n"
+        "Напиши по-русски 2–3 коротких предложения: что за дом, что в нём есть, главные плюсы и минусы "
+        "для такой семьи. Пиши ТОЛЬКО то, что есть в тексте объявления, ничего не придумывай. "
+        "Если важного нет в тексте — так и скажи (например, «про воду не сказано»). "
+        "Без вступлений, без markdown.\n\n"
+        f"Заголовок: {info['title']}\nЦена: {info['price']}\nМесто: {info['place']}\n"
+        f"Параметры:\n{tags}\n\nОписание:\n{info.get('description', '')[:4000]}"
+    )
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": getattr(config, "AI_MODEL", "claude-haiku-5-5"), "max_tokens": 300,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=60)
+        if resp.status_code != 200:
+            print("Claude API:", resp.status_code, resp.text[:300])
+            if resp.status_code in (400, 401, 402, 403, 404):
+                _ai_off = True  # нет денег / лимит / неверный ключ — до конца запуска без AI
+            return None
+        data = resp.json()
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        return text.strip() or None
+    except (requests.RequestException, ValueError) as e:
+        print("Claude API:", type(e).__name__)
+        return None
+
+
+def card(info, labels, a, summary=None, ai=False):
     e = html.escape
     hot = a["score"] >= config.HOT_SCORE
-    lines = [
+    head = [
         ("🔥 " if hot else "🏠 ") + f"<b>{e(info['title'])}</b>",
         f"💰 {e(info['price'])}" + (f"  ·  📍 {e(info['place'])}" if info["place"] else ""),
-        f"🔎 {e(' + '.join(labels))}",
-        f"<b>Баллы: {a['score']}</b>",
+        f"<b>Баллы: {a['score']}</b>  ·  🔎 {e(' + '.join(labels))}",
+        "",
+        ("🤖 " if ai else "📝 ") + "<b>Кратко:</b> " + e(summary or rule_summary(a, info)),
         "",
         "   ".join(a["marks"]),
     ]
     if a["extras"]:
-        lines.append("➕ " + ", ".join(a["extras"]))
-    lines.append(f"Стены: {e(a['walls'])}")
-    lines.append(f"🏗️ Фундамент: {e(a['found'])}")
+        head.append("➕ " + e(", ".join(a["extras"])))
+    head.append(f"Стены: {e(a['walls'])}  ·  🏗️ Фундамент: {e(a['found'])}")
     for n in a["notes"]:
-        lines.append(e(n))
-    if a["questions"]:
-        q = Q.get(getattr(config, "QUESTION_LANG", "ru"), Q["ru"])
-        msg = q["hello"] + "\n" + "\n".join("– " + x for x in a["questions"])
-        lines += ["", "💬 <b>Вопросы продавцу</b> (нажмите, чтобы скопировать):",
-                  f"<code>{e(msg)}</code>"]
-    return "\n".join(lines)
+        head.append(e(n))
+    if info.get("tags"):
+        head += ["", "🏷️ <b>Теги OLX:</b>"] + [f"• {e(n)}: {e(v)}" for n, v in info["tags"]]
+    out = "\n".join(head)
+
+    desc = info.get("description") or ""
+    if desc:
+        room = 3900 - len(re.sub(r"<[^>]+>", "", out)) - 60
+        if room > 200:
+            short = desc if len(desc) <= room else desc[:room].rsplit(" ", 1)[0] + "…"
+            out += "\n\n📄 <b>Описание</b> (нажмите, чтобы раскрыть):\n" \
+                   f"<blockquote expandable>{e(short)}</blockquote>"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +999,9 @@ def main():
             continue
         print(f"[{label}] объявлений: {len(ads)}")
         total_ads += len(ads)
+        cut = sum(1 for ad in ads if not passes(ad, opts))
+        if cut:
+            print(f"[{label}] отсеяно севернее границы: {cut} из {len(ads)}")
         for ad in ads:
             if not passes(ad, opts):
                 continue
