@@ -297,7 +297,7 @@ def analyze(text):
 OLX_API = "https://www.olx.ua/api/v1/offers/"
 
 # Области OLX: кусок ссылки -> id
-REGION_IDS = {"pol": 15, "chk": 12, "kir": 7, "vin": 24, "ko": 25, "zht": 6}
+REGION_IDS = {"pol": 15, "chk": 12, "kir": 7, "vin": 24, "ko": 25, "zht": 6, "kha": 8}
 
 
 def api_get(params):
@@ -341,15 +341,24 @@ def split_search(entry):
 
 
 def passes(ad, opts):
-    """Доп. условия поиска, например южнее определённой широты."""
-    max_lat = opts.get("max_lat")
-    if max_lat is not None:
-        try:
-            lat = float((ad.get("map") or {}).get("lat"))
-        except (TypeError, ValueError):
-            return True
-        if lat > max_lat:
-            return False
+    """Доп. условия поиска по карте: max_lat/min_lat (север/юг), max_lon/min_lon (восток/запад).
+    strict=True — отбрасывать объявления без точки на карте."""
+    keys = ("max_lat", "min_lat", "max_lon", "min_lon")
+    if not any(k in opts for k in keys):
+        return True
+    m = ad.get("map") or {}
+    try:
+        lat, lon = float(m.get("lat")), float(m.get("lon"))
+    except (TypeError, ValueError):
+        return not opts.get("strict")
+    if "max_lat" in opts and lat > opts["max_lat"]:
+        return False
+    if "min_lat" in opts and lat < opts["min_lat"]:
+        return False
+    if "max_lon" in opts and lon > opts["max_lon"]:
+        return False
+    if "min_lon" in opts and lon < opts["min_lon"]:
+        return False
     return True
 
 
@@ -1022,7 +1031,7 @@ def main():
         total_ads += len(ads)
         cut = sum(1 for ad in ads if not passes(ad, opts))
         if cut:
-            print(f"[{label}] отсеяно севернее границы: {cut} из {len(ads)}")
+            print(f"[{label}] отсеяно по карте (вне выбранной части области): {cut} из {len(ads)}")
         for ad in ads:
             if not passes(ad, opts):
                 continue
