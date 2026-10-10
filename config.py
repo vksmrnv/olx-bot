@@ -12,6 +12,11 @@ SEARCHES = [
     ("Винницкая · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/vin/?currency=USD&min_id=935576009&reason=observed_search&search%5Bfilter_float_price%3Ato%5D=6500&search%5Border%5D=relevance%3Adesc"),
     ("Кировоградская · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/kir/?currency=USD&min_id=935713499&reason=observed_search&search%5Bfilter_float_price%3Ato%5D=6500&search%5Border%5D=relevance%3Adesc"),
     ("Черкасская · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/chk/?currency=USD&min_id=935689115&reason=observed_search&search%5Bfilter_float_price%3Ato%5D=6500&search%5Border%5D=relevance%3Adesc"),
+    ("Киевская (юг) · до 350 000 грн", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/ko/?currency=UAH&search%5Bfilter_float_price%3Ato%5D=350000", {"max_lat": 50.30}),
+    ("Киевская (юг) · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/ko/?currency=USD&search%5Bfilter_float_price%3Ato%5D=6500", {"max_lat": 50.30}),
+    ("Житомирская (юг) · до 350 000 грн", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/zht/?currency=UAH&search%5Bfilter_float_price%3Ato%5D=350000", {"max_lat": 50.20, "region_id": 6}),
+    ("Житомирская (юг) · до 6 500 $", "https://www.olx.ua/uk/nedvizhimost/doma/prodazha-domov/zht/?currency=USD&search%5Bfilter_float_price%3Ato%5D=6500", {"max_lat": 50.20, "region_id": 6}),
+
 ]
 
 # С какого количества баллов ставить 🔥
