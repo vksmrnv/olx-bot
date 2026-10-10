@@ -531,14 +531,31 @@ def process_buttons(state):
     """Обрабатывает нажатия «Скрыть» и «Ошибка бота»."""
     state.setdefault("hidden", [])
     state.setdefault("sent", {})
-    upd = tg_api("getUpdates", {"offset": state.get("tg_offset", 0), "timeout": 0,
+    # Берём ВСЕ неподтверждённые нажатия (без offset): так номера Telegram не важны,
+    # даже если он их перенумерует. Повторы отсекаем по списку уже обработанных.
+    upd = tg_api("getUpdates", {"timeout": 0, "limit": 100,
                                 "allowed_updates": ["callback_query", "message"]})
     if not upd or not upd.get("ok"):
+        why = (upd or {}).get("description") or "нет ответа"
+        print("Telegram getUpdates: ошибка —", why)
+        today = date.today().isoformat()
+        if state.setdefault("errors", {}).get("getUpdates") != today:
+            tg_send("⚠️ Бот не может получить нажатия кнопок: " + html.escape(str(why)) +
+                    ". Напишите Claude.")
+            state["errors"]["getUpdates"] = today
         return False
+    results = upd.get("result", [])
+    done = state.setdefault("done_updates", [])
+    done_set = set(done)
+    print(f"Нажатий/команд от Telegram: {len(results)}")
     hidden = set(state["hidden"])
     want_best = False
-    for u in upd.get("result", []):
-        state["tg_offset"] = u["update_id"] + 1
+    for u in results:
+        uid = u.get("update_id")
+        if uid in done_set:
+            continue
+        done.append(uid)
+        done_set.add(uid)
         m = u.get("message") or {}
         if str((m.get("from") or {}).get("id")) == TG_CHAT:
             cmd = (m.get("text") or "").strip().lower()
@@ -589,6 +606,10 @@ def process_buttons(state):
             tg_api("deleteMessages", {"chat_id": TG_CHAT, "message_ids": to_delete[:100]})
         print(("Не нравится: " if action == "h" else "Ошибка: ") + ad_id)
     state["hidden"] = state["hidden"][-SEEN_LIMIT:]
+    state["done_updates"] = done[-2000:]
+    if results:
+        # подтверждаем Telegram, что всё забрали
+        tg_api("getUpdates", {"offset": max(u["update_id"] for u in results) + 1, "timeout": 0, "limit": 1})
     return want_best
 
 
